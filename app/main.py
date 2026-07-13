@@ -40,4 +40,5 @@ def health_check() -> dict:
     return {"status": "ok", "database": "connected"}
 
 
-app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
+if FRONTEND_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
