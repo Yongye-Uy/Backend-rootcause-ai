@@ -21,7 +21,7 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+psycopg://rootcause:rootcause@localhost:5432/rootcause_ai"
 
-    cors_origins: str = ""
+    cors_origins: str = "*"
 
     llm_provider_order: str = "nvidia,openrouter,ollama,huggingface,gemini"
 
