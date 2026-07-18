@@ -6,7 +6,6 @@ class QuestionList(BaseModel):
 
 
 class RootCauseAnalysis(BaseModel):
-    needs_more_info: bool
     questions: list[str] = Field(default_factory=list)
     root_cause: str = ""
 

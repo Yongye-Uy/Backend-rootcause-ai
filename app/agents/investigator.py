@@ -26,34 +26,6 @@ def _build_agent() -> Agent:
     )
 
 
-def generate_questions(
-    problem_text: str,
-    max_questions: int = DEFAULT_MAX_QUESTIONS,
-    extra_context: str = "",
-) -> list[str]:
-    agent = _build_agent()
-    description = (
-        f'The user described this problem:\n"""{problem_text}"""\n\n'
-        f"{extra_context}\n\n"
-        f"Identify the most important missing information needed to find the root cause. "
-        f"Ask at most {max_questions} clear, specific clarification questions. "
-        f"Do not propose any solutions or diagnoses yet — only ask questions."
-    ).strip()
-    task = Task(
-        description=description,
-        expected_output=(
-            f"A JSON object with a 'questions' list of at most {max_questions} short, specific "
-            f"questions."
-        ),
-        agent=agent,
-        output_pydantic=QuestionList,
-    )
-    crew = Crew(agents=[agent], tasks=[task], memory=False, verbose=False)
-    result = crew.kickoff()
-    questions = result.pydantic.questions if result.pydantic else []
-    return questions[:max_questions]
-
-
 def analyze_answers(
     problem_text: str,
     qa_pairs: list[tuple[str, str]],
@@ -61,21 +33,17 @@ def analyze_answers(
     extra_context: str = "",
 ) -> RootCauseAnalysis:
     agent = _build_agent()
-    qa_text = "\n".join(f"Q: {q}\nA: {a}" for q, a in qa_pairs)
+    qa_text = "\n".join(f"Q: {q}\nA: {a}" for q, a in qa_pairs) if qa_pairs else "No clarification questions answered yet."
 
     if allow_followup:
         instruction = (
-            "Decide if you have enough information to confidently state the root cause. "
-            "If not, set needs_more_info=true and provide up to 3 more targeted questions "
-            "(leave root_cause empty in that case). If you do have enough information, set "
-            "needs_more_info=false and provide a clear, specific root_cause description (leave "
-            "questions empty in that case)."
+            "You must state your best-guess root cause based on the information available, even if imperfect. "
+            "If you feel you need more information to be certain, you may optionally provide up to 3 targeted clarification questions."
         )
     else:
         instruction = (
             "You must now state your best-guess root cause based on the information available, "
-            "even if imperfect. Set needs_more_info=false and questions=[] no matter what, and "
-            "provide your most likely root_cause description."
+            "even if imperfect. Do not ask any more clarification questions."
         )
 
     description = (
@@ -87,8 +55,8 @@ def analyze_answers(
     task = Task(
         description=description,
         expected_output=(
-            "A JSON object with needs_more_info (bool), questions (list of strings), and "
-            "root_cause (string)."
+            "A JSON object with 'questions' (list of strings, can be empty) and "
+            "'root_cause' (string)."
         ),
         agent=agent,
         output_pydantic=RootCauseAnalysis,
@@ -98,7 +66,6 @@ def analyze_answers(
     analysis = result.pydantic if result.pydantic else RootCauseAnalysis(root_cause=result.raw)
 
     if not allow_followup:
-        analysis.needs_more_info = False
         analysis.questions = []
 
     return analysis

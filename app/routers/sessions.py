@@ -193,14 +193,17 @@ def create_session(payload: CreateSessionRequest, db: DBSession = Depends(get_db
         return _serialize(session, message=HEALTH_REFUSAL_MESSAGE)
 
     session = models.Session(
-        problem_text=payload.problem_text, client_id=payload.client_id, phase=models.Phase.CLARIFYING
+        problem_text=payload.problem_text, client_id=payload.client_id, phase=models.Phase.ROOT_CAUSE_CONFIRM
     )
     db.add(session)
     db.flush()
 
-    questions = investigator.generate_questions(payload.problem_text)
-    for question in questions:
-        db.add(models.QAPair(session_id=session.id, round=1, question=question, answer=None))
+    analysis = investigator.analyze_answers(payload.problem_text, [], allow_followup=True)
+    _upsert_root_cause(db, session, analysis.root_cause)
+
+    if analysis.questions:
+        for question in analysis.questions:
+            db.add(models.QAPair(session_id=session.id, round=1, question=question, answer=None))
 
     _record_provider(session)
     db.commit()
@@ -216,9 +219,9 @@ def submit_answers(
     client_id: str = ClientIdHeader,
 ) -> SessionStateResponse:
     session = _get_session_or_404(session_id, client_id, db)
-    if session.phase != models.Phase.CLARIFYING:
+    if session.phase != models.Phase.ROOT_CAUSE_CONFIRM:
         raise HTTPException(
-            status_code=400, detail=f"session is in phase '{session.phase.value}', not clarifying"
+            status_code=400, detail=f"session is in phase '{session.phase.value}', not root cause confirm"
         )
 
     current_round = max((qa.round for qa in session.qa_pairs), default=1)
@@ -242,20 +245,17 @@ def submit_answers(
 
     _record_provider(session)
 
-    if analysis.needs_more_info:
+    _upsert_root_cause(db, session, analysis.root_cause)
+
+    if analysis.questions:
         for question in analysis.questions:
             db.add(
                 models.QAPair(session_id=session.id, round=current_round + 1, question=question, answer=None)
             )
-        db.commit()
-        db.refresh(session)
-        return _serialize(session)
 
-    _upsert_root_cause(db, session, analysis.root_cause)
-    session.phase = models.Phase.ROOT_CAUSE_CONFIRM
     db.commit()
     db.refresh(session)
-    return _serialize(session)
+    return _serialize(session, message="Thanks for the extra info. Here is my updated root cause.")
 
 
 @router.post("/{session_id}/confirm-root-cause", response_model=SessionStateResponse)
@@ -288,17 +288,23 @@ def confirm_root_cause(
         extra_context += f' They gave this feedback: "{payload.feedback}"'
 
     if root_cause.rejection_count < MAX_ROOT_CAUSE_REJECTIONS:
-        next_round = max(qa.round for qa in session.qa_pairs) + 1
-        questions = investigator.generate_questions(
-            session.problem_text, max_questions=2, extra_context=extra_context
+        next_round = max((qa.round for qa in session.qa_pairs), default=0) + 1
+        analysis = investigator.analyze_answers(
+            session.problem_text,
+            _answered_qa_history(session),
+            allow_followup=True,
+            extra_context=extra_context,
         )
-        for question in questions:
-            db.add(models.QAPair(session_id=session.id, round=next_round, question=question, answer=None))
-        session.phase = models.Phase.CLARIFYING
+        _upsert_root_cause(db, session, analysis.root_cause)
+
+        if analysis.questions:
+            for question in analysis.questions:
+                db.add(models.QAPair(session_id=session.id, round=next_round, question=question, answer=None))
+        
         _record_provider(session)
         db.commit()
         db.refresh(session)
-        return _serialize(session, message="Got it — a couple more questions before we try again.")
+        return _serialize(session, message="Got it — here is a revised root cause. (You can also answer some new questions to help clarify).")
 
     analysis = investigator.analyze_answers(
         session.problem_text,
