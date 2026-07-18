@@ -2,7 +2,7 @@ import re
 
 from crewai import Agent, Crew, Task
 from crewai.events import crewai_event_bus
-from crewai.events.types.tool_usage_events import ToolUsageFinishedEvent
+from crewai.events.types.tool_usage_events import ToolUsageFinishedEvent, ToolUsageStartedEvent
 from crewai_tools import TavilySearchTool
 
 from app.agents.prompts import REACT_TOOL_FORMAT_REMINDER
@@ -71,27 +71,38 @@ def _is_well_formed_url(url: str) -> bool:
     return True
 
 
+from collections.abc import Callable
+
 MAX_ATTEMPTS = 2
 
 
 def generate_solutions(
-    problem_text: str, root_cause: str, max_solutions: int = DEFAULT_MAX_SOLUTIONS
+    problem_text: str, 
+    root_cause: str, 
+    max_solutions: int = DEFAULT_MAX_SOLUTIONS,
+    progress_callback: Callable[[str], None] | None = None
 ) -> list[SolutionItem]:
     """Research Agent occasionally has an off run (weak fallback provider, dropped tool call,
     etc.) and comes back with zero usable solutions. One retry is cheap insurance against that
     transient flakiness without risking an infinite loop."""
     solutions: list[SolutionItem] = []
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        solutions = _attempt_generate_solutions(problem_text, root_cause, max_solutions)
+        if progress_callback:
+            progress_callback(f"Starting research (attempt {attempt})...")
+        solutions = _attempt_generate_solutions(problem_text, root_cause, max_solutions, progress_callback)
         if solutions:
+            if progress_callback:
+                progress_callback("Finished generating solutions.")
             return solutions
         if attempt < MAX_ATTEMPTS:
             print(f"Research Agent returned 0 verified solutions on attempt {attempt}, retrying")
+            if progress_callback:
+                progress_callback("Retrying research...")
     return solutions
 
 
 def _attempt_generate_solutions(
-    problem_text: str, root_cause: str, max_solutions: int
+    problem_text: str, root_cause: str, max_solutions: int, progress_callback: Callable[[str], None] | None = None
 ) -> list[SolutionItem]:
     researcher = _build_researcher()
     writer = _build_writer()
@@ -141,13 +152,25 @@ def _attempt_generate_solutions(
 
     seen_urls: set[str] = set()
 
+    def _capture_tool_start(source, event: ToolUsageStartedEvent) -> None:
+        if progress_callback:
+            progress_callback(f"Searching web with {event.tool_name}...")
+
     def _capture_tool_output(source, event: ToolUsageFinishedEvent) -> None:
         if event.output:
             seen_urls.update(_URL_RE.findall(str(event.output)))
+            if progress_callback:
+                progress_callback("Analyzing search results...")
 
     with crewai_event_bus.scoped_handlers():
+        crewai_event_bus.on(ToolUsageStartedEvent)(_capture_tool_start)
         crewai_event_bus.on(ToolUsageFinishedEvent)(_capture_tool_output)
+        
+        if progress_callback:
+            progress_callback("Planning research strategy...")
         result = crew.kickoff()
+        if progress_callback:
+            progress_callback("Synthesizing final solutions...")
 
     solutions = result.pydantic.solutions if result.pydantic else []
 

@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
 from sqlalchemy import desc
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as DBSession
@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session as DBSession
 from app import models
 from app.agents import investigator, planner, research
 from app.agents.planner import SelectedSolution
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.guardrail import HEALTH_REFUSAL_MESSAGE, check_health_related
 from app.llm.manager import get_llm_manager
 from app.routers._shared import get_session_or_404 as _get_session_or_404
@@ -80,6 +80,7 @@ def _serialize(session: models.Session, message: str | None = None) -> SessionSt
             for p in session.plans
         ],
         message=message,
+        processing_steps=list(session.processing_steps),
     )
 
 
@@ -123,35 +124,222 @@ def _upsert_root_cause(
     return root_cause
 
 
-def _run_research(db: DBSession, session: models.Session, root_cause_description: str) -> None:
-    solutions = research.generate_solutions(session.problem_text, root_cause_description)
-    if not solutions:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "The Research Agent couldn't produce any verified solutions right now "
-                "(this can happen when free-tier providers are having an off moment) — "
-                "please try confirming the root cause again."
-            ),
+def _run_research_bg(session_id: int, root_cause_description: str) -> None:
+    db = SessionLocal()
+    try:
+        session = db.query(models.Session).get(session_id)
+        if not session:
+            return
+
+        def _step_callback(step: str):
+            steps = list(session.processing_steps)
+            steps.append(step)
+            session.processing_steps = steps
+            db.commit()
+
+        _step_callback("Starting background research...")
+
+        solutions = research.generate_solutions(
+            session.problem_text, root_cause_description, progress_callback=_step_callback
         )
-    for rank, item in enumerate(solutions, start=1):
+        
+        if not solutions:
+            # Revert to root cause confirm if research fails
+            session.phase = models.Phase.ROOT_CAUSE_CONFIRM
+            db.commit()
+            return
+            
+        for rank, item in enumerate(solutions, start=1):
+            db.add(
+                models.Solution(
+                    session_id=session.id,
+                    rank=rank,
+                    name=item.name,
+                    explanation=item.explanation,
+                    resources=item.resources,
+                    cost=item.cost,
+                    difficulty=item.difficulty,
+                    time_estimate=item.time_estimate,
+                    pros=item.pros,
+                    cons=item.cons,
+                    risks=item.risks,
+                    sources=[s.model_dump() for s in item.sources],
+                )
+            )
+        session.phase = models.Phase.SOLUTION_SELECT
+        db.commit()
+    except Exception as e:
+        session = db.query(models.Session).get(session_id)
+        if session:
+            session.phase = models.Phase.ROOT_CAUSE_CONFIRM
+            db.commit()
+        print(f"Background research failed: {e}")
+    finally:
+        db.close()
+
+
+def _analyze_answers_bg(
+    session_id: int,
+    problem_text: str,
+    qa_pairs: list[tuple[str, str]],
+    allow_followup: bool,
+    extra_context: str,
+    next_round: int
+) -> None:
+    db = SessionLocal()
+    try:
+        session = db.query(models.Session).get(session_id)
+        if not session:
+            return
+
+        def _step_callback(step: str):
+            steps = list(session.processing_steps)
+            steps.append(step)
+            session.processing_steps = steps
+            db.commit()
+
+        analysis = investigator.analyze_answers(
+            problem_text=problem_text,
+            qa_pairs=qa_pairs,
+            allow_followup=allow_followup,
+            extra_context=extra_context,
+            progress_callback=_step_callback,
+        )
+
+        _upsert_root_cause(db, session, analysis.root_cause)
+
+        if analysis.questions:
+            for question in analysis.questions:
+                db.add(models.QAPair(session_id=session.id, round=next_round, question=question, answer=None))
+
+        session.phase = models.Phase.ROOT_CAUSE_CONFIRM
+        _record_provider(session)
+        db.commit()
+    except Exception as e:
+        print(f"Background analysis failed: {e}")
+    finally:
+        db.close()
+
+
+def _analyze_and_research_bg(
+    session_id: int, problem_text: str, qa_pairs: list[tuple[str, str]], extra_context: str
+) -> None:
+    db = SessionLocal()
+    try:
+        session = db.query(models.Session).get(session_id)
+        if not session: return
+        def _step_callback(step: str):
+            steps = list(session.processing_steps)
+            steps.append(step)
+            session.processing_steps = steps
+            db.commit()
+            
+        analysis = investigator.analyze_answers(
+            problem_text, qa_pairs, allow_followup=False, extra_context=extra_context, progress_callback=_step_callback
+        )
+        final_root_cause = _upsert_root_cause(db, session, analysis.root_cause, confirmed=True)
+        db.commit()
+        
+        _step_callback("Starting background research...")
+        solutions = research.generate_solutions(
+            session.problem_text, final_root_cause.description, progress_callback=_step_callback
+        )
+        if not solutions:
+            session.phase = models.Phase.ROOT_CAUSE_CONFIRM
+            db.commit()
+            return
+        
+        for rank, item in enumerate(solutions, start=1):
+            db.add(
+                models.Solution(
+                    session_id=session.id,
+                    rank=rank,
+                    name=item.name,
+                    explanation=item.explanation,
+                    resources=item.resources,
+                    cost=item.cost,
+                    difficulty=item.difficulty,
+                    time_estimate=item.time_estimate,
+                    pros=item.pros,
+                    cons=item.cons,
+                    risks=item.risks,
+                    sources=[s.model_dump() for s in item.sources],
+                )
+            )
+        session.phase = models.Phase.SOLUTION_SELECT
+        db.commit()
+    except Exception as e:
+        print(f"Background analyze and research failed: {e}")
+    finally:
+        db.close()
+
+
+def _generate_plan_bg(session_id: int, solution_id: int) -> None:
+    db = SessionLocal()
+    try:
+        session = db.query(models.Session).get(session_id)
+        if not session:
+            return
+        solution = db.query(models.Solution).get(solution_id)
+        if not solution:
+            return
+            
+        def _step_callback(step: str):
+            steps = list(session.processing_steps)
+            steps.append(step)
+            session.processing_steps = steps
+            db.commit()
+
+        root_cause = max(session.root_causes, key=lambda rc: rc.id)
+        plan_output = planner.generate_plan(
+            session.problem_text,
+            root_cause.description,
+            SelectedSolution(
+                name=solution.name,
+                explanation=solution.explanation,
+                resources=solution.resources,
+                cost=solution.cost,
+                difficulty=solution.difficulty,
+                time_estimate=solution.time_estimate,
+                sources=solution.sources,
+            ),
+            progress_callback=_step_callback
+        )
+        
+        if not plan_output.steps or not plan_output.sources:
+            session.phase = models.Phase.SOLUTION_SELECT
+            db.commit()
+            return
+
+        llm_provider = get_llm_manager().last_provider
         db.add(
-            models.Solution(
+            models.Plan(
                 session_id=session.id,
-                rank=rank,
-                name=item.name,
-                explanation=item.explanation,
-                resources=item.resources,
-                cost=item.cost,
-                difficulty=item.difficulty,
-                time_estimate=item.time_estimate,
-                pros=item.pros,
-                cons=item.cons,
-                risks=item.risks,
-                sources=[s.model_dump() for s in item.sources],
+                solution_id=solution.id,
+                llm_provider=llm_provider,
+                overview=plan_output.overview,
+                requirements=plan_output.requirements,
+                tools=plan_output.tools,
+                cost=plan_output.cost,
+                timeline=plan_output.timeline,
+                steps=plan_output.steps,
+                possible_problems=plan_output.possible_problems,
+                alternatives=plan_output.alternatives,
+                sources=[s.model_dump() for s in plan_output.sources],
             )
         )
-    session.phase = models.Phase.SOLUTION_SELECT
+        session.selected_solution_id = solution.id
+        session.phase = models.Phase.DONE
+        _record_provider(session)
+        db.commit()
+    except Exception as e:
+        session = db.query(models.Session).get(session_id)
+        if session:
+            session.phase = models.Phase.SOLUTION_SELECT
+            db.commit()
+        print(f"Background planning failed: {e}")
+    finally:
+        db.close()
 
 
 @router.get("", response_model=list[SessionSummaryOut])
@@ -177,7 +365,11 @@ def list_sessions(
 
 
 @router.post("", response_model=SessionStateResponse)
-def create_session(payload: CreateSessionRequest, db: DBSession = Depends(get_db)) -> SessionStateResponse:
+def create_session(
+    payload: CreateSessionRequest, 
+    background_tasks: BackgroundTasks,
+    db: DBSession = Depends(get_db)
+) -> SessionStateResponse:
     guardrail_result = check_health_related(payload.problem_text)
 
     if guardrail_result.is_health_related:
@@ -193,28 +385,32 @@ def create_session(payload: CreateSessionRequest, db: DBSession = Depends(get_db
         return _serialize(session, message=HEALTH_REFUSAL_MESSAGE)
 
     session = models.Session(
-        problem_text=payload.problem_text, client_id=payload.client_id, phase=models.Phase.ROOT_CAUSE_CONFIRM
+        problem_text=payload.problem_text, client_id=payload.client_id, phase=models.Phase.CLARIFYING
     )
+    session.processing_steps = []
     db.add(session)
     db.flush()
 
-    analysis = investigator.analyze_answers(payload.problem_text, [], allow_followup=True)
-    _upsert_root_cause(db, session, analysis.root_cause)
+    background_tasks.add_task(
+        _analyze_answers_bg,
+        session_id=session.id,
+        problem_text=payload.problem_text,
+        qa_pairs=[],
+        allow_followup=True,
+        extra_context="",
+        next_round=1
+    )
 
-    if analysis.questions:
-        for question in analysis.questions:
-            db.add(models.QAPair(session_id=session.id, round=1, question=question, answer=None))
-
-    _record_provider(session)
     db.commit()
     db.refresh(session)
-    return _serialize(session)
+    return _serialize(session, message="Analyzing problem...")
 
 
 @router.post("/{session_id}/answers", response_model=SessionStateResponse)
 def submit_answers(
     session_id: int,
     payload: AnswersRequest,
+    background_tasks: BackgroundTasks,
     db: DBSession = Depends(get_db),
     client_id: str = ClientIdHeader,
 ) -> SessionStateResponse:
@@ -239,29 +435,30 @@ def submit_answers(
     db.flush()
 
     allow_followup = current_round < MAX_CLARIFICATION_ROUNDS
-    analysis = investigator.analyze_answers(
-        session.problem_text, _answered_qa_history(session), allow_followup=allow_followup
+    
+    session.phase = models.Phase.CLARIFYING
+    session.processing_steps = []
+    
+    background_tasks.add_task(
+        _analyze_answers_bg,
+        session_id=session.id,
+        problem_text=session.problem_text,
+        qa_pairs=_answered_qa_history(session),
+        allow_followup=allow_followup,
+        extra_context="",
+        next_round=current_round + 1
     )
-
-    _record_provider(session)
-
-    _upsert_root_cause(db, session, analysis.root_cause)
-
-    if analysis.questions:
-        for question in analysis.questions:
-            db.add(
-                models.QAPair(session_id=session.id, round=current_round + 1, question=question, answer=None)
-            )
 
     db.commit()
     db.refresh(session)
-    return _serialize(session, message="Thanks for the extra info. Here is my updated root cause.")
+    return _serialize(session, message="Thanks for the extra info. Analyzing...")
 
 
 @router.post("/{session_id}/confirm-root-cause", response_model=SessionStateResponse)
 def confirm_root_cause(
     session_id: int,
     payload: ConfirmRootCauseRequest,
+    background_tasks: BackgroundTasks,
     db: DBSession = Depends(get_db),
     client_id: str = ClientIdHeader,
 ) -> SessionStateResponse:
@@ -276,11 +473,13 @@ def confirm_root_cause(
 
     if payload.confirmed:
         root_cause.confirmed = True
-        _run_research(db, session, root_cause.description)
+        session.phase = models.Phase.RESEARCHING
+        session.processing_steps = []
+        background_tasks.add_task(_run_research_bg, session.id, root_cause.description)
         _record_provider(session)
         db.commit()
         db.refresh(session)
-        return _serialize(session, message="Root cause confirmed. Here are the top solutions.")
+        return _serialize(session, message="Root cause confirmed. Initiating research...")
 
     root_cause.rejection_count += 1
     extra_context = f'The user rejected this proposed root cause: "{root_cause.description}".'
@@ -289,31 +488,31 @@ def confirm_root_cause(
 
     if root_cause.rejection_count < MAX_ROOT_CAUSE_REJECTIONS:
         next_round = max((qa.round for qa in session.qa_pairs), default=0) + 1
-        analysis = investigator.analyze_answers(
-            session.problem_text,
-            _answered_qa_history(session),
+        
+        session.phase = models.Phase.CLARIFYING
+        session.processing_steps = []
+        background_tasks.add_task(
+            _analyze_answers_bg,
+            session_id=session.id,
+            problem_text=session.problem_text,
+            qa_pairs=_answered_qa_history(session),
             allow_followup=True,
             extra_context=extra_context,
+            next_round=next_round
         )
-        _upsert_root_cause(db, session, analysis.root_cause)
-
-        if analysis.questions:
-            for question in analysis.questions:
-                db.add(models.QAPair(session_id=session.id, round=next_round, question=question, answer=None))
-        
-        _record_provider(session)
         db.commit()
         db.refresh(session)
-        return _serialize(session, message="Got it — here is a revised root cause. (You can also answer some new questions to help clarify).")
+        return _serialize(session, message="Got it — re-analyzing...")
 
-    analysis = investigator.analyze_answers(
-        session.problem_text,
-        _answered_qa_history(session),
-        allow_followup=False,
-        extra_context=extra_context,
+    session.phase = models.Phase.RESEARCHING
+    session.processing_steps = []
+    background_tasks.add_task(
+        _analyze_and_research_bg,
+        session_id=session.id,
+        problem_text=session.problem_text,
+        qa_pairs=_answered_qa_history(session),
+        extra_context=extra_context
     )
-    final_root_cause = _upsert_root_cause(db, session, analysis.root_cause, confirmed=True)
-    _run_research(db, session, final_root_cause.description)
     _record_provider(session)
     db.commit()
     db.refresh(session)
@@ -321,7 +520,7 @@ def confirm_root_cause(
         session,
         message=(
             "We've reached the maximum number of attempts, so this root cause was accepted "
-            "automatically and here are the top solutions."
+            "automatically. Initiating research..."
         ),
     )
 
@@ -330,6 +529,7 @@ def confirm_root_cause(
 def select_solution(
     session_id: int,
     payload: SelectSolutionRequest,
+    background_tasks: BackgroundTasks,
     db: DBSession = Depends(get_db),
     client_id: str = ClientIdHeader,
 ) -> SessionStateResponse:
@@ -355,62 +555,14 @@ def select_solution(
         return _serialize(session, message=f'"{solution.name}" selected. Showing your saved plan.')
 
     session.selected_solution_id = solution.id
-    db.flush()
-
-    root_cause = max(session.root_causes, key=lambda rc: rc.id)
-    plan_output = planner.generate_plan(
-        session.problem_text,
-        root_cause.description,
-        SelectedSolution(
-            name=solution.name,
-            explanation=solution.explanation,
-            resources=solution.resources,
-            cost=solution.cost,
-            difficulty=solution.difficulty,
-            time_estimate=solution.time_estimate,
-            sources=solution.sources,
-        ),
-    )
-    if not plan_output.steps or not plan_output.sources:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "The Planner Agent couldn't produce a complete plan right now "
-                "(this can happen when free-tier providers are having an off moment) — "
-                "please try selecting a solution again."
-            ),
-        )
-
-    llm_provider = get_llm_manager().last_provider
-    db.add(
-        models.Plan(
-            session_id=session.id,
-            solution_id=solution.id,
-            llm_provider=llm_provider,
-            overview=plan_output.overview,
-            requirements=plan_output.requirements,
-            tools=plan_output.tools,
-            cost=plan_output.cost,
-            timeline=plan_output.timeline,
-            steps=plan_output.steps,
-            possible_problems=plan_output.possible_problems,
-            alternatives=plan_output.alternatives,
-            sources=[s.model_dump() for s in plan_output.sources],
-        )
-    )
-    session.phase = models.Phase.DONE
-    _record_provider(session)
-    try:
-        db.commit()
-    except IntegrityError:
-        # Rare race: two requests generated a plan for the same solution concurrently.
-        # Fall back to whichever one actually landed instead of erroring out.
-        db.rollback()
-        session.selected_solution_id = solution.id
-        session.phase = models.Phase.DONE
-        db.commit()
+    session.phase = models.Phase.PLANNING
+    session.processing_steps = []
+    
+    background_tasks.add_task(_generate_plan_bg, session.id, solution.id)
+    
+    db.commit()
     db.refresh(session)
-    return _serialize(session, message=f'"{solution.name}" selected. Here is your implementation plan.')
+    return _serialize(session, message=f'"{solution.name}" selected. Generating plan...')
 
 
 @router.post("/{session_id}/back-to-solutions", response_model=SessionStateResponse)

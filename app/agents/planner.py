@@ -79,16 +79,30 @@ def _is_well_formed_url(url: str) -> bool:
 MAX_ATTEMPTS = 2
 
 
-def generate_plan(problem_text: str, root_cause: str, solution: SelectedSolution) -> PlanOutput:
+from typing import Callable
+from crewai.events.types.tool_usage_events import ToolUsageStartedEvent, ToolUsageFinishedEvent
+
+def generate_plan(
+    problem_text: str,
+    root_cause: str,
+    solution: SelectedSolution,
+    progress_callback: Callable[[str], None] | None = None,
+) -> PlanOutput:
     """Planner Agent occasionally has an off run (weak fallback provider, dropped tool call, etc.)
     and comes back with no steps or no verified sources. One retry is cheap insurance against that
     transient flakiness without risking an infinite loop."""
+    if progress_callback:
+        progress_callback("Planning research strategy...")
+
     plan = PlanOutput(
         overview="", requirements="", tools="", cost="", timeline="",
         possible_problems="", alternatives="",
     )
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        plan = _attempt_generate_plan(problem_text, root_cause, solution)
+        if progress_callback and attempt > 1:
+            progress_callback(f"Retrying plan generation (attempt {attempt})...")
+            
+        plan = _attempt_generate_plan(problem_text, root_cause, solution, progress_callback)
         if plan.steps and plan.sources:
             return plan
         if attempt < MAX_ATTEMPTS:
@@ -96,7 +110,12 @@ def generate_plan(problem_text: str, root_cause: str, solution: SelectedSolution
     return plan
 
 
-def _attempt_generate_plan(problem_text: str, root_cause: str, solution: SelectedSolution) -> PlanOutput:
+def _attempt_generate_plan(
+    problem_text: str,
+    root_cause: str,
+    solution: SelectedSolution,
+    progress_callback: Callable[[str], None] | None = None,
+) -> PlanOutput:
     researcher = _build_researcher()
     writer = _build_writer()
 
@@ -167,14 +186,28 @@ def _attempt_generate_plan(problem_text: str, root_cause: str, solution: Selecte
     crew = Crew(agents=[researcher, writer], tasks=[search_task, write_task], memory=False, verbose=False)
 
     seen_urls: set[str] = {s["url"] for s in solution.sources}
+    
+    def _tool_started(source, event: ToolUsageStartedEvent) -> None:
+        if progress_callback:
+            progress_callback(f"Using tool {event.tool_name} to find plan details...")
 
     def _capture_tool_output(source, event: ToolUsageFinishedEvent) -> None:
+        if progress_callback:
+            progress_callback("Analyzing gathered information...")
         if event.output:
             seen_urls.update(_URL_RE.findall(str(event.output)))
 
     with crewai_event_bus.scoped_handlers():
+        crewai_event_bus.on(ToolUsageStartedEvent)(_tool_started)
         crewai_event_bus.on(ToolUsageFinishedEvent)(_capture_tool_output)
+        
+        if progress_callback:
+            progress_callback("Starting research phase...")
+            
         result = crew.kickoff()
+        
+        if progress_callback:
+            progress_callback("Drafting final plan steps...")
 
     plan = result.pydantic if result.pydantic else PlanOutput(
         overview=result.raw, requirements="", tools="", cost="", timeline="",

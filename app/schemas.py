@@ -82,3 +82,4 @@ class SessionStateResponse(BaseModel):
     plans: list[PlanOut] = []
     llm_provider_used: str | None = None
     message: str | None = None
+    processing_steps: list[str] = []

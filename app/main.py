@@ -31,6 +31,16 @@ def on_startup() -> None:
     import app.models  # noqa: F401  (register models on Base before create_all)
 
     Base.metadata.create_all(bind=engine)
+    
+    # Auto-migrate the processing_steps column if it's missing (e.g. on Render)
+    with engine.begin() as conn:
+        try:
+            if engine.dialect.name == "postgresql":
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN processing_steps JSONB DEFAULT '[]'::jsonb"))
+            else:
+                conn.execute(text("ALTER TABLE sessions ADD COLUMN processing_steps JSON DEFAULT '[]'"))
+        except Exception:
+            pass # Column likely already exists
 
 
 @app.get("/api/health")

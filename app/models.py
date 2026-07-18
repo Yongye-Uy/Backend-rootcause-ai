@@ -38,6 +38,7 @@ class Session(Base):
     selected_solution_id: Mapped[int | None] = mapped_column(
         ForeignKey("solutions.id"), nullable=True
     )
+    processing_steps: Mapped[list[str]] = mapped_column(JSONB, default=list)
 
     qa_pairs: Mapped[list["QAPair"]] = relationship(
         back_populates="session", cascade="all, delete-orphan", foreign_keys="QAPair.session_id"

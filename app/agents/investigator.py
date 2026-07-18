@@ -26,12 +26,18 @@ def _build_agent() -> Agent:
     )
 
 
+from typing import Callable
+
 def analyze_answers(
     problem_text: str,
     qa_pairs: list[tuple[str, str]],
     allow_followup: bool,
     extra_context: str = "",
+    progress_callback: Callable[[str], None] | None = None,
 ) -> RootCauseAnalysis:
+    if progress_callback:
+        progress_callback("Analyzing problem context...")
+
     agent = _build_agent()
     qa_text = "\n".join(f"Q: {q}\nA: {a}" for q, a in qa_pairs) if qa_pairs else "No clarification questions answered yet."
 
@@ -61,11 +67,20 @@ def analyze_answers(
         agent=agent,
         output_pydantic=RootCauseAnalysis,
     )
+    
+    if progress_callback:
+        progress_callback("Generating root cause hypothesis...")
+        
     crew = Crew(agents=[agent], tasks=[task], memory=False, verbose=False)
     result = crew.kickoff()
+    
+    if progress_callback:
+        progress_callback("Finalizing analysis...")
+        
     analysis = result.pydantic if result.pydantic else RootCauseAnalysis(root_cause=result.raw)
 
     if not allow_followup:
         analysis.questions = []
 
     return analysis
+
